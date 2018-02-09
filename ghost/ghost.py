@@ -34,6 +34,8 @@ from .bindings import (
     QtNetwork,
     QtWarningMsg,
     QtWebKit,
+    QWebView,
+    QWebPage,
     QUrl,
     binding,
     qInstallMsgHandler,
@@ -77,7 +79,8 @@ class QTMessageProxy(object):
     def __init__(self, logger):
         self.logger = logger
 
-    def __call__(self, msgType, msg):
+    def __call__(self, *args):
+        msgType, msg = args[0], args[-1]
         levels = {
             QtDebugMsg: logging.DEBUG,
             QtWarningMsg: logging.WARNING,
@@ -87,12 +90,12 @@ class QTMessageProxy(object):
         self.logger.log(levels[msgType], msg)
 
 
-class GhostWebPage(QtWebKit.QWebPage):
+class GhostWebPage(QWebPage):
     """Overrides QtWebKit.QWebPage in order to intercept some graphical
     behaviours like alert(), confirm().
     Also intercepts client side console.log().
     """
-    def __init__(self, app, session):
+    def __init__(self, session):
         self.session = session
         super(GhostWebPage, self).__init__()
 
@@ -120,10 +123,7 @@ class GhostWebPage(QtWebKit.QWebPage):
         self.session.logger.info("alert('%s')", message)
 
     def _get_value(self, value):
-        if callable(value):
-            return value()
-
-        return value
+        return value() if callable(value) else value
 
     def javaScriptConfirm(self, frame, message):
         """Checks if session is waiting for confirm, then returns the right
@@ -152,13 +152,24 @@ class GhostWebPage(QtWebKit.QWebPage):
         value = self.session._prompt_expected
         self.session.logger.info("prompt('%s')", message)
         value = self._get_value(value)
+
+        # PySide and PyQt4 (on python3) and PyQt5 return a (bool, string)
+        # 2-tuple
+        # In some instance (like in unittest), value is not a string so set
+        # a realistic replacement value
+        #
+        # FIXME: check if it makes sense to return false according to
+        # self.session._prompt_expected
+        if not isinstance(value, str):
+            value = ''
+
         if value == '':
             self.session.logger.warning(
                 "'%s' prompt filled with empty string", message,
             )
 
         if result is None:
-            # PySide
+            # PySide, PyQt4/PY3 and PyQt5 return branch
             return True, value
 
         result.append(unicode(value))
@@ -229,7 +240,14 @@ class HttpResource(object):
             charset = re.search(r'charset=([^;]+)', content_type)
             # As specified in RFC 2616 Section 3.7.1
             charset = charset.expand(r'\1') if charset else 'iso-8859-1'
-            self.content = qt_type_to_python(content, encoding=charset)
+            try:
+                self.content = qt_type_to_python(content,
+                                                 encoding=charset)
+            except UnicodeDecodeError:
+                # Server signaled text content but for some reason sent
+                # non-text content. Reset Content-Type header.
+                self.content = content.data()
+                self.headers['Content-Type'] = 'application/octet-stream'
         else:
             self.content = content.data()
 
@@ -250,7 +268,7 @@ def reply_ready_peek(reply):
     :param reply: QNetworkReply object.
     """
     if not hasattr(reply, 'data'):
-        reply.data = ''
+        reply.data = b'' if PY3 else ''
 
     reply.data += reply.peek(reply.bytesAvailable())
 
@@ -272,12 +290,26 @@ def reply_destroyed(reply):
     :param reply: QNetworkReply object.
     """
     key = id(reply)
-    qnam = reply.manager()
-    qnam.logger.debug('Reply for %s destroyed', reply.url().toString())
+    try:
+        qnam = reply.manager()
+    except (RuntimeError, AttributeError):
+        # reply is already destroyed
+        reply_logger = logging.getLogger('ghost.reply.destroyed')
+        reply_logger.debug('destroyed: %s', key)
+        return
+
+    # In some instance PySide and PyQt4 appear to attach the original
+    # QNetworkAccessManager instead of our custom class (most likely because
+    # the manager was destroyed already)
+    if not isinstance(qnam, NetworkAccessManager):
+        return
+
+    reply_logger = qnam.logger
+    reply_logger.debug('Reply for %s destroyed', reply.url().toString())
 
     if key in qnam._registry:
         qnam._registry.pop(key)
-        qnam.logger.warning(
+        reply_logger.warning(
             'Reply for %s did not trigger finished or error signal',
             reply.url().toString()
         )
@@ -285,14 +317,26 @@ def reply_destroyed(reply):
 
 def reply_download_progress(reply, received, total):
     """Log `reply` download progress."""
-    reply.manager().logger.debug('Downloading content of %s: %s of %s',
-                                 reply.url().toString(), received, total)
+    try:
+        reply_logger = reply.manager().logger
+        reply_logger.debug('Downloading content of %s: %s of %s',
+                           reply.url().toString(), received, total)
+    except (RuntimeError, AttributeError):
+        reply_logger = logging.getLogger('ghost.reply.downloadProgress')
+        reply_logger.debug('Downloading content of reply %s: %s of %s',
+                           id(reply), received, total)
 
 
 def _reply_error_callback(reply, error_code):
     """Log an error message on QtNetworkReply error."""
-    reply.manager().logger.error('Reply for %s encountered an error: %s',
-                                 reply.url().toString(), reply.errorString())
+    try:
+        reply_logger = reply.manager().logger
+        reply_logger.error('Reply for %s encountered an error: %s',
+                           reply.url().toString(), reply.errorString())
+    except (RuntimeError, AttributeError):
+        reply_logger = logging.getLogger('ghost.reply.error')
+        reply_logger.error('Reply for reply %s encountered an error: %s',
+                           id(reply), error_code)
 
 
 class NetworkAccessManager(QNetworkAccessManager):
@@ -330,7 +374,8 @@ class NetworkAccessManager(QNetworkAccessManager):
         reply.downloadProgress.connect(partial(reply_download_progress, reply))
         reply.error.connect(partial(_reply_error_callback, reply))
 
-        self.logger.debug('Registring reply for %s', reply.url().toString())
+        self.logger.debug('Registring reply %s for %s',
+                          id(reply), reply.url().toString())
         self._registry[id(reply)] = reply
         return reply
 
@@ -350,6 +395,13 @@ class NetworkAccessManager(QNetworkAccessManager):
         """Count in-flight QNetworkReply."""
         return len(self._registry)
 
+    def __del__(self):
+        self.logger.debug('Deleting QNetworkAccessManager %s', id(self))
+        for _, reply in self._registry.items():
+            self.logger.debug('Aborting %s', reply.url().toString())
+            reply.abort()
+            reply.deleteLater()
+
 
 class Ghost(object):
     """`Ghost` manages a Qt application.
@@ -368,7 +420,7 @@ class Ghost(object):
         defaults=None,
     ):
         if not binding:
-            raise RuntimeError("Ghost.py requires PySide or PyQt4")
+            raise RuntimeError("Ghost.py requires PySide, PyQt4 or PyQt5")
 
         self.logger = logger.getChild('application')
 
@@ -391,20 +443,23 @@ class Ghost(object):
             self.logger.debug('Using X11 display server %s',
                               os.environ['DISPLAY'])
 
-        self.logger.info('Initializing QT application')
-        Ghost._app = QApplication.instance() or QApplication(['ghost'])
-
         qInstallMsgHandler(QTMessageProxy(logging.getLogger('qt')))
         if plugin_path:
             for p in plugin_path:
-                Ghost._app.addLibraryPath(p)
+                self.app.addLibraryPath(p)
 
         self.defaults = defaults or dict()
 
+    @property
+    def app(self):
+        if Ghost._app is None:
+            self.logger.info('Initializing QT application')
+            Ghost._app = QApplication.instance() or QApplication(['ghost'])
+        return Ghost._app
+
     def exit(self):
-        if self._app:
-            self.logger.info('Stopping QT application')
-            self._app.quit()
+        self.logger.info('Stopping QT application')
+        self.app.quit()
         if hasattr(self, 'xvfb'):
             self.logger.debug('Terminating Xvfb display server')
             self.xvfb.stop()
@@ -443,7 +498,6 @@ class Session(object):
     _confirm_expected = None
     _prompt_expected = None
     _upload_file = None
-    _app = None
 
     def __init__(
         self,
@@ -484,7 +538,7 @@ class Session(object):
         self.display = display
 
         self.popup_messages = []
-        self.page = web_page_class(self.ghost._app, self)
+        self.page = web_page_class(self)
 
         if network_access_manager_class is not None:
             self.page.setNetworkAccessManager(
@@ -543,7 +597,7 @@ class Session(object):
 
         self.main_frame = self.page.mainFrame()
 
-        class GhostQWebView(QtWebKit.QWebView):
+        class GhostQWebView(QWebView):
             def sizeHint(self):
                 return QSize(*viewport_size)
 
@@ -716,7 +770,7 @@ class Session(object):
             printer.setFullPage(True)
         printer.setOutputFileName(path)
         if self.webview is None:
-            self.webview = QtWebKit.QWebView()
+            self.webview = QWebView()
             self.webview.setPage(self.page)
         self.webview.setZoomFactor(zoom_factor)
         self.webview.print_(printer)
@@ -809,11 +863,10 @@ class Session(object):
         """Exits all Qt widgets."""
         self.logger.info("Closing session")
         self.page.deleteLater()
-        self.ghost._app.processEvents()
-        del self.webview
-        del self.cookie_jar
-        del self.manager
-        del self.main_frame
+        self.webview.deleteLater()
+        self.cookie_jar.deleteLater()
+        self.manager.deleteLater()
+        self.main_frame.deleteLater()
 
     @can_load_page
     def fill(self, selector, values):
@@ -878,7 +931,10 @@ class Session(object):
             QtCookieJar.setAllCookies(allCookies)
 
         def toQtCookie(PyCookie):
-            qc = QNetworkCookie(PyCookie.name, PyCookie.value)
+            qc = QNetworkCookie(
+                PyCookie.name.encode('utf-8'),
+                PyCookie.value.encode('utf-8')
+            )
             qc.setSecure(PyCookie.secure)
             if PyCookie.path_specified:
                 qc.setPath(PyCookie.path)
@@ -1246,14 +1302,14 @@ class Session(object):
         """
         self.logger.debug('Showing webview')
         self.webview.show()
-        self.ghost._app.processEvents()
+        self.ghost.app.processEvents()
 
     def sleep(self, value=0.1):
         started_at = time.time()
 
         while time.time() <= (started_at + value):
             time.sleep(value / 10)
-            self.ghost._app.processEvents()
+            self.ghost.app.processEvents()
 
     def wait_for(self, condition, timeout_message, timeout=None):
         """Waits until condition is True.
@@ -1360,7 +1416,6 @@ class Session(object):
         """Called back when page is loaded.
         """
         self.loaded = True
-        self.ghost._app.processEvents()
 
     def _page_load_started(self):
         """Called back when page load started.
