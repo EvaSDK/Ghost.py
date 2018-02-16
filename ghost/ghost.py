@@ -46,7 +46,7 @@ try:
 except ImportError:
     from http.cookiejar import Cookie, LWPCookieJar
 
-__version__ = "0.2.3.post7"
+__version__ = "0.2.3.post8"
 
 
 PY3 = sys.version > '3'
