@@ -1,32 +1,31 @@
 # -*- coding: utf-8 -*-
 
 import os
-import sys
-
-PY3 = sys.version > '3'
-
-if PY3:
-    unicode = str
-    long = int
 
 
-binding = None
+def _load_binding():
+    if 'GHOST_QT_PROVIDER' in os.environ:
+        bindings = [os.environ['GHOST_QT_PROVIDER']]
+    else:
+        bindings = ["PyQt5", "PySide", "PyQt4"]
 
-if 'GHOST_QT_PROVIDER' in os.environ:
-    bindings = [os.environ['GHOST_QT_PROVIDER']]
-else:
-    bindings = ["PyQt5", "PySide", "PyQt4"]
+    for name in bindings:
+        try:
+            binding = __import__(name)
+            if name.startswith('PyQt'):
+                import sip
+                sip.setapi('QVariant', 2)
 
-for name in bindings:
-    try:
-        binding = __import__(name)
-        if name.startswith('PyQt'):
-            import sip
-            sip.setapi('QVariant', 2)
+        except ImportError:
+            continue
+        break
+    else:
+        name, binding = None, None
 
-    except ImportError:
-        continue
-    break
+    return name, binding
+
+
+BINDING_NAME, BINDING = _load_binding()
 
 
 class LazyBinding(object):
@@ -39,13 +38,13 @@ class LazyBinding(object):
 
 
 def _import(name):
-    if binding is None:
+    if BINDING is None:
         return LazyBinding()
 
-    name = "%s.%s" % (binding.__name__, name)
+    name = "%s.%s" % (BINDING.__name__, name)
     module = __import__(name)
-    for n in name.split(".")[1:]:
-        module = getattr(module, n)
+    for component in name.split(".")[1:]:
+        module = getattr(module, component)
     return module
 
 
@@ -58,7 +57,7 @@ QtCriticalMsg = QtCore.QtCriticalMsg
 QtDebugMsg = QtCore.QtDebugMsg
 QtFatalMsg = QtCore.QtFatalMsg
 QtWarningMsg = QtCore.QtWarningMsg
-if name == "PyQt5":
+if BINDING_NAME == "PyQt5":
     qInstallMsgHandler = QtCore.qInstallMessageHandler
 else:
     qInstallMsgHandler = QtCore.qInstallMsgHandler
@@ -67,7 +66,7 @@ QtGui = _import("QtGui")
 QImage = QtGui.QImage
 QPainter = QtGui.QPainter
 QRegion = QtGui.QRegion
-if name == "PyQt5":
+if BINDING_NAME == "PyQt5":
     QtWidgets = _import("QtWidgets")
     QtPrintSupport = _import("QtPrintSupport")
     QApplication = QtWidgets.QApplication
@@ -86,7 +85,7 @@ QSslConfiguration = QtNetwork.QSslConfiguration
 QSsl = QtNetwork.QSsl
 
 QtWebKit = _import('QtWebKit')
-if name == "PyQt5":
+if BINDING_NAME == "PyQt5":
     QtWebKitWidgets = _import("QtWebKitWidgets")
     QWebPage = QtWebKitWidgets.QWebPage
     QWebView = QtWebKitWidgets.QWebView

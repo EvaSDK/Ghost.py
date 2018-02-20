@@ -37,7 +37,7 @@ from .bindings import (
     QWebView,
     QWebPage,
     QUrl,
-    binding,
+    BINDING,
     qInstallMsgHandler,
 )
 
@@ -398,9 +398,16 @@ class NetworkAccessManager(QNetworkAccessManager):
     def __del__(self):
         self.logger.debug('Deleting QNetworkAccessManager %s', id(self))
         for _, reply in self._registry.items():
-            self.logger.debug('Aborting %s', reply.url().toString())
-            reply.abort()
-            reply.deleteLater()
+            try:
+                self.logger.debug('Aborting %s', reply.url().toString())
+                reply.abort()
+                reply.deleteLater()
+            except RuntimeError:
+                # reply could be deleted already because QApplication stopped
+                # before Python triggers QNAM.__del__, like on TimeoutError
+                self.logger.debug('Reply for reply %s already deleted',
+                                  id(reply))
+                pass
 
 
 class Ghost(object):
@@ -419,7 +426,7 @@ class Ghost(object):
         plugin_path=['/usr/lib/mozilla/plugins', ],
         defaults=None,
     ):
-        if not binding:
+        if not BINDING:
             raise RuntimeError("Ghost.py requires PySide, PyQt4 or PyQt5")
 
         qt_platform = os.environ.get('QT_QPA_PLATFORM', 'xcb')
@@ -434,8 +441,8 @@ class Ghost(object):
                 try:
                     self.logger.debug('Using Xvfb display server')
                     self.xvfb = Xvfb(
-                        width=display_size[0],
-                        height=display_size[1],
+                        width=800,
+                        height=600,
                     )
                     self.xvfb.start()
 
@@ -1187,7 +1194,7 @@ class Session(object):
             el.setFocus()
             el.setPlainText(value)
 
-        res, ressources = None, []
+        res, resources = None, []
         element = self.main_frame.findFirstElement(selector)
         if element.isNull():
             raise Error('can\'t find element for %s"' % selector)
@@ -1245,7 +1252,7 @@ class Session(object):
         if blur:
             self.call(selector, 'blur')
 
-        return res, ressources
+        return res, resources
 
     def set_proxy(
         self,
