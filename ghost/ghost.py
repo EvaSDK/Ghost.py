@@ -19,6 +19,7 @@ from .bindings import (
     QNetworkAccessManager,
     QNetworkCookie,
     QNetworkCookieJar,
+    QNetworkDiskCache,
     QNetworkProxy,
     QNetworkRequest,
     QPainter,
@@ -42,9 +43,9 @@ from .bindings import (
 )
 
 try:
-    from cookielib import Cookie, LWPCookieJar
+    from cookielib import Cookie, CookieJar, LWPCookieJar
 except ImportError:
-    from http.cookiejar import Cookie, LWPCookieJar
+    from http.cookiejar import Cookie, CookieJar, LWPCookieJar
 
 __version__ = "0.2.3.post9"
 
@@ -226,7 +227,7 @@ class HttpResource(object):
     """
     def __init__(self, session, reply, content):
         self.session = session
-        self.url = reply.url().toString()
+        self.url = unicode(reply.url().toString())
         self.headers = {
             qt_type_to_python(header):
             qt_type_to_python(reply.rawHeader(header))
@@ -356,7 +357,8 @@ class NetworkAccessManager(QNetworkAccessManager):
 
     def createRequest(self, operation, request, data):
         """Create a new QNetworkReply."""
-        if self._regex and self._regex.findall(str(request.url().toString())):
+        if self._regex and self._regex.findall(
+                unicode(request.url().toString())):
             reply = super(NetworkAccessManager, self).createRequest(
                 QNetworkAccessManager.GetOperation,
                 QNetworkRequest(QUrl())
@@ -498,6 +500,10 @@ class Session(object):
     :param display: A boolean that tells ghost to displays UI.
     :param viewport_size: A tuple that sets initial viewport size.
     :param ignore_ssl_errors: A boolean that forces ignore ssl errors.
+    :param cache_dir: A 2-tuple containing the path where to store cache data
+      and its maximum size in bytes. If None, will default to
+      $XDG_CACHE_HOME directory and either GHOST_CACHE_SIZE environment
+      variable (in MB) or 50MB.
     :param plugins_enabled: Enable plugins (like Flash).
     :param java_enabled: Enable Java JRE.
     :param download_images: Indicate if the browser should download images
@@ -520,6 +526,7 @@ class Session(object):
         display=False,
         viewport_size=(800, 600),
         ignore_ssl_errors=True,
+        cache_dir=None,
         plugins_enabled=False,
         java_enabled=False,
         javascript_enabled=True,
@@ -556,6 +563,20 @@ class Session(object):
             self.page.setNetworkAccessManager(
                 network_access_manager_class(exclude_regex=exclude,
                                              logger=self.logger))
+
+        # Network disk cache
+        cache = QNetworkDiskCache(self.ghost.app)
+        if cache_dir:
+            cache.setCacheDirectory(cache_dir[0])
+            cache.setMaximumCacheSize(cache_dir[1])
+        else:
+            cache.setCacheDirectory(
+                os.environ.get('XDG_CACHE_HOME',
+                               os.path.expanduser("~/.cache/ghost-py")))
+            cache.setMaximumCacheSize(
+                int(os.environ.get('GHOST_CACHE_SIZE', 50)) * 1024 * 1024
+            )
+        self.page.networkAccessManager().setCache(cache)
 
         QtWebKit.QWebSettings.setMaximumPagesInCache(0)
         QtWebKit.QWebSettings.setObjectCacheCapacities(0, 0, 0)
@@ -843,6 +864,12 @@ class Session(object):
         """Clears the alert message"""
         self._alert = None
 
+    def clear_cache(self):
+        """Clear disk cache."""
+        cache = self.manager.cache()
+        if cache:
+            cache.clear()
+
     @can_load_page
     def evaluate(self, script):
         """Evaluates script in page frame.
@@ -960,11 +987,11 @@ class Session(object):
             #   py cookie.rest / QNetworkCookie.setHttpOnly()
             return qc
 
-        if cookie_storage.__class__.__name__ == 'str':
+        if isinstance(cookie_storage, str):
             cj = LWPCookieJar(cookie_storage)
             cj.load()
             toQtCookieJar(cj, self.cookie_jar)
-        elif cookie_storage.__class__.__name__.endswith('CookieJar'):
+        elif isinstance(cookie_storage, CookieJar):
             toQtCookieJar(cookie_storage, self.cookie_jar)
         else:
             raise ValueError('unsupported cookie_storage type.')
@@ -982,6 +1009,7 @@ class Session(object):
         client_certificate=None,
         encode_url=True,
         user_agent=None,
+        use_cache=True,
     ):
         """Opens a web page.
 
@@ -1003,6 +1031,7 @@ class Session(object):
         "key_path" both paths corresponding to the certificate and key files
         :param encode_url Set to true if the url have to be encoded
         :param user_agent An option user agent string.
+        :param use_cache: Whether to use disk cache.
         :return: Page resource, and all loaded resources, unless wait
         is False, in which case it returns None.
         """
@@ -1047,9 +1076,17 @@ class Session(object):
             request = QNetworkRequest(QUrl(address))
         else:
             request = QNetworkRequest(QUrl.fromEncoded(address))
-        request.CacheLoadControl(0)
+
+        if use_cache and self.manager.cache() is not None:
+            self.logger.debug('Using disk cache')
+            request.CacheLoadControl(1)
+        else:
+            self.logger.debug('Not using disk cache')
+            request.CacheLoadControl(0)
+
         for header in headers:
             request.setRawHeader(header, headers[header])
+
         self._auth = auth
         self._auth_attempt = 0  # Avoids reccursion
 
@@ -1137,11 +1174,11 @@ class Session(object):
                 rest,
             )
 
-        if cookie_storage.__class__.__name__ == 'str':
+        if isinstance(cookie_storage, str):
             cj = LWPCookieJar(cookie_storage)
             toPyCookieJar(self.cookie_jar, cj)
             cj.save()
-        elif cookie_storage.__class__.__name__.endswith('CookieJar'):
+        elif isinstance(cookie_storage, CookieJar):
             toPyCookieJar(self.cookie_jar, cookie_storage)
         else:
             raise ValueError('unsupported cookie_storage type.')
